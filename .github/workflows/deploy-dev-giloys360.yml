@@ -1,0 +1,142 @@
+# Build and Deploy Giloys360 website to dev environment
+# Mirrors the pattern from the GiloysClient workflow
+
+name: Build and Deploy to dev:Giloys360
+
+on:
+  push:
+    branches: [ "dev" ]
+    paths:
+      - services/Giloys360/**   # only triggers when this service changes
+  workflow_dispatch:            # allow manual trigger from GitHub UI
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      # ── 2. Docker Buildx ───────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      # ── 3. Docker Hub Login ────────────────────────────────────
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # ── 4. Tag current dev image as dev.previous (safe rollback)
+      - name: Tag current dev image as dev.previous
+        run: |
+          if docker pull giloyshub/giloys360:dev; then
+            docker tag giloyshub/giloys360:dev giloyshub/giloys360:dev.previous
+            docker push giloyshub/giloys360:dev.previous
+          else
+            echo "No existing dev image found — skipping dev.previous tag"
+          fi
+
+      # ── 5. Generate image metadata / tags ─────────────────────
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: giloyshub/giloys360
+          tags: |
+            type=raw,value={{date 'YYYYMMDD'}}
+
+      # ── 6. Build & Push Docker image ──────────────────────────
+      - name: Build and push Docker image
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/Giloys360
+          file: ./services/Giloys360/Dockerfile
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            giloyshub/giloys360:dev
+            ${{ steps.meta.outputs.tags }}-${{ github.run_id }}
+          # Pass build-time env vars (baked into the React bundle at build)
+          build-args: |
+            REACT_SERVER_URL=https://giloys.com
+            REACT_CLIENT_URL=http://giloys.com:5003
+            MY_ENV=dev
+          # GitHub Actions cache speeds up repeat builds significantly
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── 7. Copy docker-compose to VPS ─────────────────────────
+      - name: Copy docker-compose to VPS
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.SSH_HOST_DEV }}
+          username: ${{ secrets.SSH_USER_DEV }}
+          port: ${{ secrets.SSH_PORT }}
+          password: ${{ secrets.SSH_PASSWORD_DEV }}
+          source: "./services/Giloys360/docker-compose.yml"
+          target: "~/"
+
+      # ── 8. Deploy on VPS via SSH ──────────────────────────────
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST_DEV }}
+          username: ${{ secrets.SSH_USER_DEV }}
+          password: ${{ secrets.SSH_PASSWORD_DEV }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            # Ensure shared Docker network exists
+            docker network create giloys-network || echo "giloys-network already exists"
+
+            # Clean up previous compose file
+            rm -rf ~/services/Giloys360/compose.yml
+            mkdir -p ~/services/Giloys360
+
+            # Substitute placeholders in docker-compose.yml → compose.yml
+            export VER="dev"
+            sed "s/IMAGE_VERSION/$VER/g" ~/services/Giloys360/docker-compose.yml \
+            | sed "s/REACT_SERVER_URL_VALUE/https:\/\/giloys.com/g" \
+            | sed "s/REACT_CLIENT_URL_VALUE/http:\/\/giloys.com:5003/g" \
+            | sed "s/GILOYS_NETWORK/giloys-network/g" \
+            | sed "s#HOST_PORT#5003#g" \
+            | sed "s#MY_ENV#dev#g" \
+            > ~/services/Giloys360/compose.yml
+
+            # Stop and remove old container if running
+            if docker ps | grep -q 'giloys360:dev'; then
+              container_id=$(docker ps | grep 'giloys360:dev' | awk '{print $1}')
+              docker stop $container_id
+              docker rm $container_id
+            fi
+
+            # Remove old image to force fresh pull
+            docker rmi giloyshub/giloys360:dev || echo "No old dev image found — skipping removal"
+
+            # Start new container (logs go to /var/tmp/logs/)
+            mkdir -p /var/tmp/logs
+            docker compose -f ~/services/Giloys360/compose.yml up -d \
+              2>/var/tmp/logs/giloys360_stderr.log \
+              1>/var/tmp/logs/giloys360_stdout.log
+
+            # ── Wait for container to be healthy (max 5 min) ──
+            elapsed_time=0
+            while ! docker ps | grep -q 'giloys360-dev' && [ $elapsed_time -lt 300 ]; do
+              echo "Waiting for giloys360-dev container to start... (${elapsed_time}s elapsed)"
+              sleep 20
+              elapsed_time=$((elapsed_time + 20))
+            done
+
+            if [ $elapsed_time -ge 300 ]; then
+              echo "❌ Timeout! giloys360-dev did not start within 300 seconds."
+              cat /var/tmp/logs/giloys360_stderr.log
+              exit 1
+            fi
+
+            echo "✅ Giloys360 is up and running on port 5003!"
